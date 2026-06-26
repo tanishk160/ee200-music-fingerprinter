@@ -20,3 +20,5 @@ fingerprint/db_numpy.npz
 # fingerprint/db_song_idx.npy  ~13 MB - DO commit
 # fingerprint/db_t_anchor.npy  ~26 MB - DO commit
 # fingerprint/db_songs.txt     tiny   - DO commit
+
+fingerprint/db_chunk_*.pkl
