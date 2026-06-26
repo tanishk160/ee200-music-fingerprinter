@@ -108,62 +108,81 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ── constants ────────────────────────────────────────────────────────────────
-DB_PATH         = "fingerprint/database.pkl"        # monolithic (local only)
-DB_CHUNK_DIR    = "fingerprint"                     # dir with db_chunk_*.pkl
-DB_CHUNK_PREFIX = "db_chunk_"
-PEAKS_CACHE     = "fingerprint/songs_peaks.pkl"
-N_FFT           = 4096
-HOP             = HOP_DEFAULT
-NEIGHBORHOOD    = (20, 20)
-MIN_AMP_DB      = -50.0
+# ── constants & database ──────────────────────────────────────────────────────
+DB_PARTS_DIR = "fingerprint"
+DB_SQLITE_GZ = "fingerprint/fingerprint.sqlite.gz"
+DB_SQLITE = "fingerprint/fingerprint.sqlite"
+PEAKS_CACHE = "fingerprint/songs_peaks.pkl"
+N_FFT = 4096
+HOP = 512
+NEIGHBORHOOD = (20, 20)
+MIN_AMP_DB = -50.0
 
+def compile_db():
+    import sqlite3
+    import pickle
+    
+    if not os.path.exists(DB_SQLITE):
+        chunks = sorted([f for f in os.listdir(DB_PARTS_DIR) if f.startswith("db_chunk_") and f.endswith(".pkl")])
+        if not chunks:
+            return
+            
+        with st.spinner("Initializing/compiling SQLite database from chunks on first startup (takes ~15-30s)..."):
+            db_tmp = DB_SQLITE + ".tmp"
+            if os.path.exists(db_tmp):
+                try:
+                    os.remove(db_tmp)
+                except Exception:
+                    pass
+                    
+            conn = sqlite3.connect(db_tmp)
+            c = conn.cursor()
+            c.execute('''CREATE TABLE hashes (f_anchor INTEGER, f_other INTEGER, delta_t INTEGER, song_id TEXT, t_anchor INTEGER)''')
+            
+            for chunk_name in chunks:
+                path = os.path.join(DB_PARTS_DIR, chunk_name)
+                with open(path, "rb") as f:
+                    data = pickle.load(f)
+                    rows = []
+                    for h, matches in data.items():
+                        fa, fo, dt = h
+                        for sid, ta in matches:
+                            rows.append((fa, fo, dt, sid, ta))
+                    c.executemany("INSERT INTO hashes VALUES (?,?,?,?,?)", rows)
+                    
+            c.execute("CREATE INDEX idx_hashes ON hashes (f_anchor, f_other, delta_t)")
+            conn.commit()
+            conn.close()
+            
+            # Atomic rename to prevent corrupt/partial DB files
+            try:
+                os.rename(db_tmp, DB_SQLITE)
+            except Exception as e:
+                if not os.path.exists(DB_SQLITE):
+                    raise e
 
-# ── cached resources ──────────────────────────────────────────────────────────
-def _load_db_chunks():
-    """Load database from multiple small chunk files (GitHub-safe)."""
-    chunk_files = sorted(
-        f for f in os.listdir(DB_CHUNK_DIR)
-        if f.startswith(DB_CHUNK_PREFIX) and f.endswith(".pkl")
-    )
-    if not chunk_files:
-        return None
-    merged = {}
-    for i, fname in enumerate(chunk_files):
-        path = os.path.join(DB_CHUNK_DIR, fname)
-        with open(path, "rb") as f:
-            chunk = pickle.load(f)
-        merged.update(chunk)
-    return merged
+@st.cache_resource
+def get_db_path():
+    compile_db()
+    return DB_SQLITE
 
-
-@st.cache_resource(show_spinner="Loading fingerprint database …")
-def get_db():
-    # Prefer chunked files (deployed version); fall back to monolithic pkl
-    chunk_files = [
-        f for f in os.listdir(DB_CHUNK_DIR)
-        if f.startswith(DB_CHUNK_PREFIX) and f.endswith(".pkl")
-    ] if os.path.isdir(DB_CHUNK_DIR) else []
-
-    if chunk_files:
-        db = _load_db_chunks()
-    elif os.path.exists(DB_PATH):
-        db = load_database(DB_PATH)
-    else:
-        return None, None
-
-    if db is None:
-        return None, None
-
-    # build single-peak db if songs_peaks is available
+@st.cache_resource
+def get_single_db():
+    import pickle
     if os.path.exists(PEAKS_CACHE):
         with open(PEAKS_CACHE, "rb") as f:
             songs_peaks = pickle.load(f)
-        single_db = build_single_peak_db(songs_peaks)
-    else:
-        single_db = None
-    return db, single_db
+        return build_single_peak_db(songs_peaks)
+    return None
 
+def get_db():
+    import sqlite3
+    db_path = get_db_path()
+    if not os.path.exists(db_path):
+        return None, None
+    conn = sqlite3.connect(db_path)
+    single_db = get_single_db()
+    return conn, single_db
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 def fingerprint_clip(path: str):
@@ -219,7 +238,10 @@ with st.sidebar:
     if db is None:
         st.error("⚠️ No database found.\nRun `build_database.py` first.")
     else:
-        st.success(f"✅ Database loaded  \n`{len(db):,}` unique hashes")
+        c = db.cursor()
+        c.execute("SELECT COUNT(*) FROM hashes")
+        count = c.fetchone()[0]
+        st.success(f"✅ Database loaded  \n`{count:,}` unique hashes")
     st.divider()
     st.markdown(
         "**How it works**\n\n"
@@ -426,3 +448,7 @@ else:
             file_name="results.csv",
             mime="text/csv",
         )
+
+# Close SQLite connection cleanly at the end of run
+if 'db' in locals() and db is not None:
+    db.close()

@@ -9,12 +9,14 @@ from typing import Dict, List, Tuple, Optional
 from .hashes import generate_hashes
 
 
+import sqlite3
+
 # ── paired-hash matching ─────────────────────────────────────────────────────
 def match_query(query_peaks: List[Tuple[int, int]],
-                db: Dict[tuple, List[Tuple[str, int]]],
+                db_conn: sqlite3.Connection,
                 **hash_kwargs) -> Dict[str, np.ndarray]:
     """
-    Compare query peaks against the database using paired hashes.
+    Compare query peaks against the database using paired hashes via SQLite.
 
     Returns
     -------
@@ -22,12 +24,29 @@ def match_query(query_peaks: List[Tuple[int, int]],
               offset = t_db_anchor - t_query_anchor
     """
     offsets: Dict[str, list] = defaultdict(list)
+    
+    hashes = list(generate_hashes(query_peaks, **hash_kwargs))
+    if not hashes:
+        return {}
 
-    for h, t_query in generate_hashes(query_peaks, **hash_kwargs):
-        if h not in db:
-            continue
-        for song_id, t_db in db[h]:
-            offsets[song_id].append(t_db - t_query)
+    c = db_conn.cursor()
+    c.execute("CREATE TEMPORARY TABLE IF NOT EXISTS query_hashes (f_anchor INTEGER, f_other INTEGER, delta_t INTEGER, t_query INTEGER)")
+    c.execute("DELETE FROM query_hashes")
+    c.executemany("INSERT INTO query_hashes VALUES (?,?,?,?)", 
+                  [(h[0], h[1], h[2], t_q) for h, t_q in hashes])
+    
+    c.execute("""
+        SELECT h.song_id, h.t_anchor, q.t_query
+        FROM hashes h
+        JOIN query_hashes q 
+          ON h.f_anchor = q.f_anchor 
+         AND h.f_other = q.f_other 
+         AND h.delta_t = q.delta_t
+    """)
+    for song_id, t_db, t_query in c.fetchall():
+        offsets[song_id].append(t_db - t_query)
+        
+    c.execute("DROP TABLE query_hashes")
 
     return {sid: np.array(vals) for sid, vals in offsets.items()}
 
