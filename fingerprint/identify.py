@@ -1,92 +1,98 @@
 """
-identify.py  –  Match a query clip against the fingerprint database.
+identify.py  -  Match a query clip against the fingerprint database.
 
-Matching strategy: stream through pkl chunk files one at a time so that
-peak RAM stays under ~30 MB regardless of database size.  No SQLite,
-no monolithic dict – works correctly on every reboot of an ephemeral
-cloud container.
+Architecture
+------------
+load_index()      :  Loads fingerprint/db_numpy.npz (pre-built offline).
+                     Takes <5 seconds, ~200 MB RAM.  Zero computation.
+
+match_query()     :  Binary-search the sorted numpy arrays.
+                     Typical query time: < 1 second.
 """
 import os
 import pickle
 import numpy as np
 import matplotlib.pyplot as plt
 from collections import defaultdict
-from typing import Dict, List, Tuple, Optional, Callable
+from typing import Dict, List, Tuple, Optional
 
 from .hashes import generate_hashes
 
+_FREQ_BINS = 2049
+_DT_RANGE  = 201
+_MULT      = _FREQ_BINS * _DT_RANGE   # compound key multiplier
 
-# ── chunk-streaming matching ─────────────────────────────────────────────────
-def match_query(query_peaks: List[Tuple[int, int]],
-                chunks_dir: str,
-                chunk_prefix: str = "db_chunk_",
-                progress_cb: Optional[Callable[[float, str], None]] = None,
-                **hash_kwargs) -> Dict[str, np.ndarray]:
+
+# ── index loader ──────────────────────────────────────────────────────────────
+def load_index(npz_path: str, song_ids_path: str):
     """
-    Compare query peaks against the database by streaming pkl chunk files.
-
-    Each chunk is loaded, searched, then immediately discarded – peak RAM
-    usage is ~25 MB per chunk regardless of total database size.
+    Load the pre-built numpy index from disk.
 
     Parameters
     ----------
-    query_peaks : list of (freq_bin, time_frame) tuples
-    chunks_dir  : directory that contains db_chunk_*.pkl files
-    chunk_prefix: prefix of chunk filenames (default 'db_chunk_')
-    progress_cb : optional callable(fraction: float, label: str) for UI updates
+    npz_path       : path to db_numpy.npz
+    song_ids_path  : path to song_ids.pkl
 
     Returns
     -------
-    offsets : {song_id: np.ndarray of time offsets}
+    (keys, sid_arr, ta_arr, song_ids)
+    keys     : int32 ndarray, sorted compound hash keys
+    sid_arr  : int8  ndarray, index into song_ids list
+    ta_arr   : uint16 ndarray, anchor time frame
+    song_ids : list[str]
     """
-    hashes = list(generate_hashes(query_peaks, **hash_kwargs))
-    if not hashes:
-        return {}
+    data = np.load(npz_path)
+    keys    = data['keys']    # int32, sorted
+    sid_arr = data['sid']     # int8
+    ta_arr  = data['ta']      # uint16
 
-    # Build a fast lookup: hash_key -> [t_query, ...]
-    query_map: Dict[tuple, list] = defaultdict(list)
-    for h, t_q in hashes:
-        query_map[h].append(t_q)
-    query_set = set(query_map.keys())
+    with open(song_ids_path, 'rb') as f:
+        song_ids = pickle.load(f)
 
+    return keys, sid_arr, ta_arr, song_ids
+
+
+# ── numpy binary-search matching ──────────────────────────────────────────────
+def match_query(query_peaks: List[Tuple[int, int]],
+                keys: np.ndarray,
+                sid_arr: np.ndarray,
+                ta_arr: np.ndarray,
+                song_ids: List[str],
+                **hash_kwargs) -> Dict[str, np.ndarray]:
+    """
+    Match query peaks against the pre-built numpy index.
+
+    Uses numpy.searchsorted for O(log N) lookup.
+    Typical time for a 15-second clip: < 1 second.
+
+    Parameters
+    ----------
+    query_peaks              : list of (freq_bin, time_frame)
+    keys, sid_arr, ta_arr    : from load_index()
+    song_ids                 : list of song ID strings
+
+    Returns
+    -------
+    offsets : {song_id: np.ndarray of int time-offsets}
+    """
     offsets: Dict[str, list] = defaultdict(list)
 
-    chunks = sorted(
-        f for f in os.listdir(chunks_dir)
-        if f.startswith(chunk_prefix) and f.endswith(".pkl")
-    )
-    if not chunks:
-        return {}
-
-    for i, chunk_name in enumerate(chunks):
-        if progress_cb:
-            progress_cb(i / len(chunks),
-                        f"Searching chunk {i+1}/{len(chunks)} …")
-
-        path = os.path.join(chunks_dir, chunk_name)
-        with open(path, "rb") as fh:
-            chunk_db: dict = pickle.load(fh)
-
-        # Only look up keys that actually appear in the query
-        for h in query_set:
-            if h not in chunk_db:
-                continue
-            for song_id, t_db in chunk_db[h]:
-                for t_q in query_map[h]:
-                    offsets[song_id].append(t_db - t_q)
-
-        del chunk_db  # release RAM immediately
-
-    if progress_cb:
-        progress_cb(1.0, "Search complete ✓")
+    for (fa, fo, dt), t_q in generate_hashes(query_peaks, **hash_kwargs):
+        qkey = int(fa) * _MULT + int(fo) * _DT_RANGE + int(dt)
+        lo = int(np.searchsorted(keys, qkey, side='left'))
+        hi = int(np.searchsorted(keys, qkey, side='right'))
+        if lo == hi:
+            continue
+        diffs   = ta_arr[lo:hi].astype(np.int64) - t_q
+        matched = sid_arr[lo:hi]
+        for k in range(hi - lo):
+            offsets[song_ids[int(matched[k])]].append(int(diffs[k]))
 
     return {sid: np.array(vals) for sid, vals in offsets.items()}
 
 
-# ── single-peak fallback ─────────────────────────────────────────────────────
-def match_single_peaks(query_peaks: List[Tuple[int, int]],
-                       db_single: Dict[tuple, List[Tuple[str, int]]]):
-    """Match using single peaks (freq_bin only) – weaker baseline."""
+# ── single-peak fallback ──────────────────────────────────────────────────────
+def match_single_peaks(query_peaks, db_single):
     offsets: Dict[str, list] = defaultdict(list)
     for f, t_q in query_peaks:
         key = (f,)
@@ -97,8 +103,7 @@ def match_single_peaks(query_peaks: List[Tuple[int, int]],
     return {sid: np.array(vals) for sid, vals in offsets.items()}
 
 
-def build_single_peak_db(songs_peaks: Dict[str, List[Tuple[int, int]]]):
-    """Build a single-peak database (weaker baseline)."""
+def build_single_peak_db(songs_peaks):
     db: Dict[tuple, list] = defaultdict(list)
     for song_id, peaks in songs_peaks.items():
         for f, t in peaks:
@@ -106,16 +111,9 @@ def build_single_peak_db(songs_peaks: Dict[str, List[Tuple[int, int]]]):
     return dict(db)
 
 
-# ── scoring ──────────────────────────────────────────────────────────────────
+# ── scoring ───────────────────────────────────────────────────────────────────
 def best_match(offsets: Dict[str, np.ndarray],
                bin_size: int = 1) -> Tuple[Optional[str], int, dict]:
-    """
-    Find the song with the most hashes aligned at a single time offset.
-
-    Returns
-    -------
-    (winner_song_id, score, scores_dict)
-    """
     scores = {}
     for song_id, offs in offsets.items():
         if len(offs) == 0:
@@ -133,16 +131,10 @@ def best_match(offsets: Dict[str, np.ndarray],
     return winner, scores[winner], scores
 
 
-# ── plotting ─────────────────────────────────────────────────────────────────
-def plot_offset_histogram(offsets: Dict[str, np.ndarray],
-                          winner: str,
-                          top_n: int = 5,
-                          bin_size: int = 1,
-                          ax=None):
-    """Plot the offset histogram for the top-N candidate songs."""
+# ── plotting ──────────────────────────────────────────────────────────────────
+def plot_offset_histogram(offsets, winner, top_n=5, bin_size=1, ax=None):
     _, _, scores = best_match(offsets, bin_size=bin_size)
     top_songs = sorted(scores, key=scores.get, reverse=True)[:top_n]
-
     created = ax is None
     if created:
         fig, axes = plt.subplots(len(top_songs), 1,
@@ -151,7 +143,6 @@ def plot_offset_histogram(offsets: Dict[str, np.ndarray],
             axes = [axes]
     else:
         axes = [ax]
-
     for idx, song_id in enumerate(top_songs):
         a = axes[idx] if created else ax
         offs = offsets.get(song_id, np.array([]))
@@ -160,12 +151,11 @@ def plot_offset_histogram(offsets: Dict[str, np.ndarray],
             bins = max(10, (hi - lo) // bin_size + 1)
             color = "#00e5ff" if song_id == winner else "#546e7a"
             a.hist(offs, bins=int(bins), color=color, edgecolor="none")
-        label = f"★ {song_id}" if song_id == winner else song_id
+        label = f"WINNER: {song_id}" if song_id == winner else song_id
         a.set_title(label, fontsize=9)
         a.set_xlabel("Time offset (frames)")
         a.set_ylabel("Hash count")
         a.grid(alpha=0.3)
-
     if created:
         plt.tight_layout()
     return axes
