@@ -1,0 +1,22 @@
+﻿__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Large old database files - DO NOT commit
+fingerprint/database.pkl
+fingerprint/database.pkl.gz
+fingerprint/songs_peaks.pkl
+fingerprint/peaks_cache.pkl
+fingerprint/song_ids.pkl
+fingerprint/fingerprint.sqlite
+fingerprint/fingerprint.sqlite.gz
+fingerprint/fingerprint.sqlite.gz.part*
+fingerprint/db_chunk_*.pkl
+fingerprint/db_numpy.npz
+
+# The new compact NPY files ARE committed (all under 100 MB):
+# fingerprint/db_hashes.npy    ~51 MB - DO commit
+# fingerprint/db_song_idx.npy  ~13 MB - DO commit
+# fingerprint/db_t_anchor.npy  ~26 MB - DO commit
+# fingerprint/db_songs.txt     tiny   - DO commit

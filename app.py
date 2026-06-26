@@ -1,43 +1,44 @@
 """
-app.py  -  Q3B Streamlit Music Fingerprinting App
+app.py  –  Q3B Streamlit Music Fingerprinting App
+===================================================
+Run locally:
+    streamlit run app.py
 
-Architecture (ephemeral-cloud-safe, OOM-proof)
------------------------------------------------
-Startup  : np.load('fingerprint/db_numpy.npz') - loads pre-built index in <5s.
-           No computation, no pkl chunks, no SQLite.  ~200 MB RAM total.
-
-Query    : numpy.searchsorted - O(log N) per hash, <1 second per clip.
+Architecture
+------------
+Uses a compact NumPy sorted-array database (fingerprint/db_*.npy) instead of
+the 317 MB pickle.  All three .npy files total ~60-80 MB and load in <5s.
+Identification of a 30-second clip takes ~3-8 seconds.
 
 Modes
 -----
-- Single-Clip : upload one query clip -> spectrogram, constellation,
-                offset histogram, matched song name.
-- Batch       : upload multiple clips -> download results.csv
+• Single-Clip Mode  : upload one query clip → shows spectrogram, constellation,
+                      offset histogram, and matched song.
+• Batch Mode        : upload multiple clips → downloads results.csv
 """
-import io
-import os
-import csv
-import time
-import tempfile
+import io, os, csv, time, pickle, tempfile
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import streamlit as st
 
-from fingerprint.audio   import load_audio, compute_spectrogram, SR, HOP_DEFAULT
-from fingerprint.peaks   import find_peaks
-from fingerprint.identify import load_index, match_query, best_match
+from fingerprint.audio    import load_audio, compute_spectrogram, SR, HOP_DEFAULT
+from fingerprint.peaks    import find_peaks
+from fingerprint.hashes   import load_npy_db, load_database, NpyDB
+from fingerprint.identify import (match_query_npy, match_query,
+                                   best_match, build_single_peak_db,
+                                   match_single_peaks)
 
-# ── page config ───────────────────────────────────────────────────────────────
+# ── page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Sonic Fingerprinter",
+    page_title="🎵 Sonic Fingerprinter",
     page_icon="🎵",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ── custom CSS ────────────────────────────────────────────────────────────────
+# ── custom CSS ───────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
@@ -95,40 +96,59 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ── constants ─────────────────────────────────────────────────────────────────
-NPZ_PATH      = "fingerprint/db_numpy.npz"
-SONG_IDS_PATH = "fingerprint/song_ids.pkl"
-N_FFT         = 4096
-HOP           = HOP_DEFAULT
-NEIGHBORHOOD  = (20, 20)
-MIN_AMP_DB    = -50.0
+# ── constants ────────────────────────────────────────────────────────────────
+NPY_DIR         = "fingerprint"
+DB_PATH         = "fingerprint/database.pkl"    # legacy fallback
+N_FFT           = 4096
+HOP             = HOP_DEFAULT
+NEIGHBORHOOD    = (20, 20)
+MIN_AMP_DB      = -50.0
+MAX_AUDIO_SECS  = 30   # only fingerprint first 30 s (fast + accurate enough)
 
 
-# ── cached index ──────────────────────────────────────────────────────────────
-@st.cache_resource(show_spinner="Loading fingerprint database …")
-def get_index():
+# ── cached DB load ─────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner="📂 Loading fingerprint database …")
+def get_db():
     """
-    Load the pre-built numpy index (db_numpy.npz).
-    Takes <5 seconds, ~200 MB RAM. Cached for entire session.
+    Load the fingerprint database.
+    Prefers compact NpyDB (~60 MB, loads in <5s) over the 317 MB pickle.
+    Returns (db_object, db_type, n_hashes, n_songs).
     """
-    if not os.path.exists(NPZ_PATH) or not os.path.exists(SONG_IDS_PATH):
-        return None, None, None, None
-    return load_index(NPZ_PATH, SONG_IDS_PATH)
+    # ── NpyDB (preferred) ────────────────────────────────────────────────────
+    npy_db = load_npy_db(NPY_DIR)
+    if npy_db is not None:
+        return npy_db, "npy", npy_db.n_hashes(), npy_db.n_songs()
+
+    # ── Pickle fallback ───────────────────────────────────────────────────────
+    if os.path.exists(DB_PATH):
+        db = load_database(DB_PATH)
+        return db, "pickle", len(db), None
+
+    return None, None, 0, 0
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 def fingerprint_clip(path: str):
+    """Load clip (≤ MAX_AUDIO_SECS), return (S_db, freqs, times, peaks)."""
     y, sr = load_audio(path, sr=SR)
-    S_db, freqs, times = compute_spectrogram(y, sr=sr, n_fft=N_FFT,
-                                             hop_length=HOP)
-    peaks = find_peaks(S_db, neighborhood=NEIGHBORHOOD,
-                       min_amplitude_db=MIN_AMP_DB)
+    max_samples = int(MAX_AUDIO_SECS * sr)
+    if len(y) > max_samples:
+        y = y[:max_samples]
+    S_db, freqs, times = compute_spectrogram(y, sr=sr, n_fft=N_FFT, hop_length=HOP)
+    peaks = find_peaks(S_db, neighborhood=NEIGHBORHOOD, min_amplitude_db=MIN_AMP_DB)
     return S_db, freqs, times, peaks
+
+
+def run_match(peaks, db_obj, db_type):
+    if db_type == "npy":
+        return match_query_npy(peaks, db_obj)
+    else:
+        return match_query(peaks, db_obj)
 
 
 def fig_to_bytes(fig):
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight",
+    fig.savefig(buf, format="png", dpi=100, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
     buf.seek(0)
     return buf
@@ -137,7 +157,7 @@ def fig_to_bytes(fig):
 def dark_fig(*args, **kwargs):
     fig, ax = plt.subplots(*args, **kwargs)
     fig.patch.set_facecolor("#0f0c29")
-    axes_list = list(ax.flat) if hasattr(ax, '__len__') else [ax]
+    axes_list = ax.flat if hasattr(ax, "flat") else [ax]
     for a in axes_list:
         a.set_facecolor("#1a1a2e")
         a.tick_params(colors="#a0a0b0")
@@ -152,52 +172,55 @@ def dark_fig(*args, **kwargs):
 # ── sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🎵 Sonic Fingerprinter")
-    st.markdown("*An EE200 Project - Music ID powered by spectral hashing*")
+    st.markdown("*An EE200 Project — Music ID powered by spectral hashing*")
     st.divider()
+
     mode = st.radio("**Mode**", ["Single-Clip", "Batch"])
     st.divider()
 
-    keys, sid_arr, ta_arr, song_ids = get_index()
+    db_obj, db_type, n_hashes, n_songs = get_db()
 
-    if keys is None:
-        st.error("db_numpy.npz not found. Run build_numpy_db.py first.")
-        db_ready = False
+    if db_obj is None:
+        st.error("⚠️ No database found.\nRun `python build_npz_db.py` first.")
     else:
+        backend = {"npy": "NumPy ⚡ (fast)", "pickle": "Pickle (legacy)"}[db_type]
         st.success(
-            f"Database ready\n"
-            f"`{len(keys):,}` hashes | `{len(song_ids)}` songs"
+            f"✅ Database ready\n\n"
+            f"**{n_hashes:,}** hash entries\n\n"
+            f"**{n_songs or '?'}** songs\n\n"
+            f"Backend: **{backend}**"
         )
-        db_ready = True
-
     st.divider()
     st.markdown(
         "**How it works**\n\n"
-        "1. Audio -> STFT spectrogram\n"
-        "2. Find local-max peaks -> constellation\n"
-        "3. Pair peaks -> compact hashes\n"
-        "4. Binary-search numpy index\n"
-        "5. Offset histogram -> matched song"
+        "1. Audio → STFT spectrogram\n"
+        "2. Find local-max peaks → *constellation*\n"
+        "3. Pair peaks → compact hashes\n"
+        "4. Binary search in sorted DB\n"
+        "5. Offset histogram → matched song ✨"
     )
+    st.caption(f"ℹ️ First **{MAX_AUDIO_SECS}s** of audio used for speed.")
 
 
-# ── main ──────────────────────────────────────────────────────────────────────
+# ── main area ─────────────────────────────────────────────────────────────────
 st.markdown("# 🎵 Sonic Fingerprinter")
 st.markdown(
     "Upload an audio clip and watch it get identified — "
     "just like Shazam, but built from scratch with DSP."
 )
 
-if not db_ready:
+if db_obj is None:
     st.warning(
-        "Fingerprint database file (db_numpy.npz) not found. "
-        "Run `python build_numpy_db.py` locally and commit the output."
+        "No fingerprint database found. "
+        "Run `python build_npz_db.py` locally, then push the "
+        "`fingerprint/db_*.npy` and `fingerprint/db_songs.txt` files to GitHub."
     )
     st.stop()
 
 
-# =============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
 # SINGLE-CLIP MODE
-# =============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
 if mode == "Single-Clip":
     st.markdown("## Single-Clip Identification")
     uploaded = st.file_uploader(
@@ -213,121 +236,128 @@ if mode == "Single-Clip":
             tmp.write(uploaded.read())
             tmp_path = tmp.name
 
-        t0 = time.time()
+        try:
+            with st.spinner("🎵 Fingerprinting clip …"):
+                t0 = time.time()
+                S_db, freqs, times, peaks = fingerprint_clip(tmp_path)
+                t_fp = time.time() - t0
 
-        with st.spinner("Fingerprinting clip …"):
-            S_db, freqs, times, peaks = fingerprint_clip(tmp_path)
+            with st.spinner(f"🔍 Matching {len(peaks):,} peaks against database …"):
+                t1 = time.time()
+                offsets = run_match(peaks, db_obj, db_type)
+                winner, score, scores = best_match(offsets)
+                t_match = time.time() - t1
 
-        with st.spinner("Matching against database …"):
-            offsets = match_query(peaks, keys, sid_arr, ta_arr, song_ids)
+            elapsed = time.time() - t0
 
-        winner, score, scores = best_match(offsets)
-        elapsed = time.time() - t0
-
-        if winner:
-            st.markdown(f"""
-            <div class="result-card">
-                <div style="font-size:0.9rem;color:#a0a0b0;">Matched Song</div>
-                <div class="match-title">{winner}</div>
-                <span class="score-badge">🏆 confidence: {score}</span>
-                <span class="score-badge" style="margin-left:8px;">⏱ {elapsed:.2f}s</span>
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            st.error("No match found. The clip may not be in the database.")
-
-        st.divider()
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.markdown("#### 📊 Spectrogram")
-            fig, ax = dark_fig(figsize=(8, 3))
-            ax.pcolormesh(times, freqs, S_db, cmap="magma",
-                          shading="auto", vmin=-80, vmax=0)
-            ax.set_xlabel("Time (s)")
-            ax.set_ylabel("Frequency (Hz)")
-            ax.set_title(f"Spectrogram - {uploaded.name}")
-            ax.set_ylim(0, 8000)
-            plt.tight_layout()
-            st.image(fig_to_bytes(fig), use_container_width=True)
-            plt.close(fig)
-
-        with col2:
-            st.markdown("#### ✨ Constellation of Peaks")
-            fig, ax = dark_fig(figsize=(8, 3))
-            ax.pcolormesh(times, freqs, S_db, cmap="magma",
-                          shading="auto", vmin=-80, vmax=0)
-            if peaks:
-                pf = [freqs[f] for f, _ in peaks]
-                pt = [times[t] for _, t in peaks]
-                ax.scatter(pt, pf, s=3, c="#00e5ff", alpha=0.7,
-                           linewidths=0, label=f"{len(peaks):,} peaks")
-            ax.set_xlabel("Time (s)")
-            ax.set_ylabel("Frequency (Hz)")
-            ax.set_title("Constellation of Peaks")
-            ax.set_ylim(0, 8000)
-            ax.legend(fontsize=8)
-            plt.tight_layout()
-            st.image(fig_to_bytes(fig), use_container_width=True)
-            plt.close(fig)
-
-        if scores:
-            st.markdown("#### 📈 Offset Histogram (Top Candidates)")
-            top_songs = sorted(scores, key=scores.get, reverse=True)[:5]
-            n = len(top_songs)
-            fig, axes = dark_fig(n, 1, figsize=(12, 2.5 * n))
-            if n == 1:
-                axes = [axes]
-            for i, song_id in enumerate(top_songs):
-                offs = offsets.get(song_id, np.array([]))
-                color = "#00e5ff" if song_id == winner else "#546e7a"
-                if len(offs):
-                    lo, hi = offs.min(), offs.max()
-                    axes[i].hist(offs, bins=max(10, int(hi - lo) + 1),
-                                 color=color, edgecolor="none")
-                lbl = (f"WINNER: {song_id}  (score={scores[song_id]})"
-                       if song_id == winner
-                       else f"{song_id}  (score={scores[song_id]})")
-                axes[i].set_title(lbl, fontsize=9)
-                axes[i].set_xlabel("Time offset (frames)")
-                axes[i].set_ylabel("Hash count")
-                axes[i].grid(alpha=0.3)
-            plt.tight_layout()
-            st.image(fig_to_bytes(fig), use_container_width=True)
-            plt.close(fig)
+            # ── result card ──
+            if winner:
+                st.markdown(f"""
+                <div class="result-card">
+                    <div style="font-size:0.9rem;color:#a0a0b0;">Matched Song</div>
+                    <div class="match-title">{winner}</div>
+                    <span class="score-badge">🏆 confidence: {score}</span>
+                    <span class="score-badge" style="margin-left:8px;">🎧 {len(peaks):,} peaks</span>
+                    <span class="score-badge" style="margin-left:8px;">⏱ {elapsed:.1f}s total</span>
+                    <span class="score-badge" style="margin-left:8px;">🔎 match: {t_match:.1f}s</span>
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.error("No match found. The clip may not be in the database.")
 
             st.divider()
-            st.markdown("#### 📊 All Candidate Scores")
-            top20 = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:20]
-            names = [x[0] for x in top20]
-            vals  = [x[1] for x in top20]
-            fig, ax = dark_fig(figsize=(12, 3))
-            bar_colors = ["#00e5ff" if n == winner else "#546e7a" for n in names]
-            ax.barh(names[::-1], vals[::-1], color=bar_colors[::-1])
-            ax.set_xlabel("Confidence Score")
-            ax.set_title("Top-20 Candidate Songs")
-            ax.grid(alpha=0.3, axis="x")
-            plt.tight_layout()
-            st.image(fig_to_bytes(fig), use_container_width=True)
-            plt.close(fig)
 
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
+            # ── visuals ──
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.markdown("#### 📊 Spectrogram")
+                fig, ax = dark_fig(figsize=(8, 3))
+                ax.pcolormesh(times, freqs, S_db, cmap="magma",
+                              shading="auto", vmin=-80, vmax=0)
+                ax.set_xlabel("Time (s)")
+                ax.set_ylabel("Frequency (Hz)")
+                ax.set_title(f"Spectrogram — {uploaded.name}")
+                ax.set_ylim(0, 8000)
+                plt.tight_layout()
+                st.image(fig_to_bytes(fig), use_container_width=True)
+                plt.close(fig)
+
+            with col2:
+                st.markdown("#### ✨ Constellation of Peaks")
+                fig, ax = dark_fig(figsize=(8, 3))
+                ax.pcolormesh(times, freqs, S_db, cmap="magma",
+                              shading="auto", vmin=-80, vmax=0)
+                if peaks:
+                    pf = [freqs[f] for f, _ in peaks]
+                    pt = [times[t] for _, t in peaks]
+                    ax.scatter(pt, pf, s=3, c="#00e5ff", alpha=0.7,
+                               linewidths=0, label=f"{len(peaks):,} peaks")
+                ax.set_xlabel("Time (s)")
+                ax.set_ylabel("Frequency (Hz)")
+                ax.set_title("Constellation of Peaks")
+                ax.set_ylim(0, 8000)
+                ax.legend(fontsize=8)
+                plt.tight_layout()
+                st.image(fig_to_bytes(fig), use_container_width=True)
+                plt.close(fig)
+
+            if scores:
+                st.markdown("#### 📈 Offset Histogram (Top Candidates)")
+                top_songs = sorted(scores, key=scores.get, reverse=True)[:5]
+                n = len(top_songs)
+                fig, axes = dark_fig(n, 1, figsize=(12, 2.5 * n))
+                if n == 1:
+                    axes = [axes]
+                for idx, song_id in enumerate(top_songs):
+                    offs = offsets.get(song_id, np.array([]))
+                    color = "#00e5ff" if song_id == winner else "#546e7a"
+                    if len(offs):
+                        lo, hi = int(offs.min()), int(offs.max())
+                        bins = max(10, hi - lo + 1)
+                        axes[idx].hist(offs, bins=bins, color=color, edgecolor="none")
+                    label = (f"★ {song_id}  (score={scores[song_id]})"
+                             if song_id == winner else
+                             f"{song_id}  (score={scores[song_id]})")
+                    axes[idx].set_title(label, fontsize=9)
+                    axes[idx].set_xlabel("Time offset (frames)")
+                    axes[idx].set_ylabel("Hash count")
+                    axes[idx].grid(alpha=0.3)
+                plt.tight_layout()
+                st.image(fig_to_bytes(fig), use_container_width=True)
+                plt.close(fig)
+
+                st.divider()
+                st.markdown("#### 📊 All Candidate Scores")
+                top20 = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:20]
+                names = [x[0] for x in top20]
+                vals  = [x[1] for x in top20]
+                fig, ax = dark_fig(figsize=(12, 3))
+                colors = ["#00e5ff" if n == winner else "#546e7a" for n in names]
+                ax.barh(names[::-1], vals[::-1], color=colors[::-1])
+                ax.set_xlabel("Confidence Score")
+                ax.set_title("Top-20 Candidate Songs")
+                ax.grid(alpha=0.3, axis="x")
+                plt.tight_layout()
+                st.image(fig_to_bytes(fig), use_container_width=True)
+                plt.close(fig)
+
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 
-# =============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
 # BATCH MODE
-# =============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
 else:
     st.markdown("## Batch Identification")
     st.markdown(
         "Upload multiple query clips. "
         "The app will identify each and produce a downloadable `results.csv`."
     )
-
     uploaded_files = st.file_uploader(
         "Upload query clips (multiple OK)",
         type=["mp3", "wav", "flac", "ogg"],
@@ -337,12 +367,11 @@ else:
 
     if uploaded_files:
         results = []
-        prog = st.progress(0, text="Processing clips …")
+        progress = st.progress(0, text="Processing clips …")
 
         for i, uf in enumerate(uploaded_files):
-            prog.progress(i / len(uploaded_files),
-                          text=f"Clip {i+1}/{len(uploaded_files)}: {uf.name}")
-
+            progress.progress(i / len(uploaded_files),
+                              text=f"Processing {uf.name} …")
             with tempfile.NamedTemporaryFile(
                 suffix=os.path.splitext(uf.name)[-1], delete=False
             ) as tmp:
@@ -351,7 +380,7 @@ else:
 
             try:
                 _, _, _, peaks = fingerprint_clip(tmp_path)
-                offsets = match_query(peaks, keys, sid_arr, ta_arr, song_ids)
+                offsets = run_match(peaks, db_obj, db_type)
                 winner, score, _ = best_match(offsets)
                 prediction = winner if winner else "unknown"
             except Exception as e:
@@ -363,11 +392,11 @@ else:
                     pass
 
             results.append({
-                "filename": os.path.splitext(uf.name)[0],
+                "filename":   os.path.splitext(uf.name)[0],
                 "prediction": prediction,
             })
 
-        prog.progress(1.0, text="Done!")
+        progress.progress(1.0, text="Done!")
 
         st.markdown("### Results")
         st.dataframe(results, use_container_width=True)
@@ -378,7 +407,7 @@ else:
         writer.writerows(results)
 
         st.download_button(
-            label="Download results.csv",
+            label="⬇️ Download results.csv",
             data=csv_buf.getvalue().encode(),
             file_name="results.csv",
             mime="text/csv",

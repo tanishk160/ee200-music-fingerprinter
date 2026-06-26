@@ -8,3 +8,8 @@ font = "sans serif"
 
 [server]
 maxUploadSize = 200
+headless = true
+
+[runner]
+# Silence "missing ScriptRunContext" warnings from background threads
+magicEnabled = false
